@@ -1,0 +1,28 @@
+kind = "web"
+previewPath = "/"
+title = "Star Sprout Quest"
+description = "A bright 3D browser game for kids where players guide a friendly character through increasingly challenging levels, collect stars, avoid hazards, and master simple keyboard controls."
+version = "1.0.0"
+id = "artifacts/bright-3d-kids-game"
+router = "path"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 19756
+
+[services.development]
+run = "pnpm --filter @workspace/bright-3d-kids-game run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/bright-3d-kids-game", "run", "build" ]
+serve = "static"
+publicDir = "artifacts/bright-3d-kids-game/dist/public"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "19756"
+BASE_PATH = "/"
