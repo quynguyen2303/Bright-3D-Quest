@@ -47,3 +47,7 @@ Thumbs.db
 # Replit
 .cache/
 .local/
+
+# fleet: never commit the app's env or its lifecycle state
+.env
+.fleet/

@@ -1,0 +1,150 @@
+# Build this repo's Dockerfile and push it to GCP Artifact Registry, tagged per branch.
+#
+# Auth is Workload Identity Federation — GitHub mints an OIDC token for this workflow,
+# Google exchanges it for a short-lived impersonation of SERVICE_ACCOUNT. No JSON key
+# is ever stored in this repo. The exchange only works once the repo is bound in the
+# WIF pool; the fleet writes that binding when it provisions the project (and the
+# preflight panel's "Image build & push" area re-does it on demand).
+#
+# The four secrets below are set on the repo by the fleet at provisioning time:
+#   SERVICE_ACCOUNT             deploy SA to impersonate
+#   WORKLOAD_IDENTITY_PROVIDER  projects/<n>/locations/global/workloadIdentityPools/<p>/providers/<x>
+#   ARTIFACT_REGISTRY_REGION    registry HOST, e.g. asia-southeast1-docker.pkg.dev
+#   ARTIFACT_REGISTRY           <gcp-project>/<repository>
+#
+# ONE IMAGE PER ENVIRONMENT (2026-09-15). The `build` job is a matrix over the fleet's
+# environments (`beta`, `production` by default — the caller passes the list). Each job
+# names the GitHub Environment of the same name, so it sees that environment's Actions
+# VARIABLES — the fleet pushes Workspace settings ▸ CI vars there (build-time config such
+# as a public API URL; never a credential) — writes them into `.env.production` before the
+# build (Next.js, Vite and CRA read that file at build time) and also passes them as
+# build-args, then pushes `<repo>-<branch>-<env>`. Both images come out of ONE run, from
+# ONE commit, so the fleet can prove production's image is the same source beta soaked.
+#
+# The markers the fleet reads from this job's log are labelled with the environment:
+#   FLEET_IMAGE[beta]=…@sha256:…         FLEET_IMAGE[production]=…@sha256:…
+#   FLEET_BUILD_ENV[beta]=<sha256 of the variables json>   (production likewise)
+#   FLEET_VERSION=<YYYY.MM.DD>-<sha7>    (shared — one commit, one label)
+# A workflow written before this prints the single unlabelled `FLEET_IMAGE=`; the fleet
+# keeps honouring both shapes.
+name: Deploy (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      environments:
+        description: 'Fleet environments to build, as a JSON list.'
+        required: false
+        default: '["beta","production"]'
+        type: string
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        env: ${{ fromJSON(inputs.environments || '["beta","production"]') }}
+    # The GitHub Environment carrying this fleet environment's build-time variables. Named
+    # after the fleet environment, not the branch: one commit of the base branch is built for
+    # every environment, so a branch-named Environment could only ever describe one of them.
+    environment: ${{ matrix.env }}
+    permissions:
+      id-token: write
+      contents: read
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          service_account: ${{ secrets.SERVICE_ACCOUNT }}
+          workload_identity_provider: ${{ secrets.WORKLOAD_IDENTITY_PROVIDER }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          version: '>= 363.0.0'
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker ${{ secrets.ARTIFACT_REGISTRY_REGION }} --quiet
+
+      # The image name is derived from the repo, not hardcoded, so this file is
+      # identical in every project the fleet provisions and a rename cannot leave a
+      # workflow pushing under the old name.
+      #
+      # The version label is <YYYY.MM.DD>-<short sha>, built from the COMMIT's own date
+      # rather than the build's, so rebuilding the same commit tomorrow reproduces the
+      # same label. Fleet derives the identical string in collector/ci_image.derive_version
+      # for repos whose workflow predates this step — keep the two shapes in step.
+      - name: Derive the image name and version
+        id: img
+        run: |
+          echo "repo_name=${GITHUB_REPOSITORY#*/}" >> "$GITHUB_OUTPUT"
+          echo "version=$(TZ=UTC git show -s --format=%cd --date=format-local:'%Y.%m.%d' "$GITHUB_SHA")-$(git rev-parse --short=7 "$GITHUB_SHA")" >> "$GITHUB_OUTPUT"
+
+      # This environment's build-time variables (Workspace settings ▸ CI vars, pushed by the
+      # fleet as Actions VARIABLES on the Environment named above). Written to
+      # `.env.production` — appended, so a file the repo commits keeps its own lines and the
+      # fleet's win by coming last — and emitted as build-args for a Dockerfile that declares
+      # ARGs. The stack packs' `.dockerignore` excludes `.env.*` (a developer's local env must
+      # never ride into an image), so the file is re-included for THIS build only with a
+      # trailing `!` rule in the checkout — nothing is committed. `vars` holds no secrets by
+      # construction (GitHub returns them in clear), and the hash lets the fleet say WHICH set
+      # of variables an image was built with.
+      - name: Build-time environment
+        id: benv
+        env:
+          FLEET_VARS_JSON: ${{ toJSON(vars) }}
+        run: |
+          printf '%s' "$FLEET_VARS_JSON" > /tmp/fleet-vars.json
+          {
+            echo ""
+            echo "# --- fleet build-time env (${{ matrix.env }}) ---"
+            jq -r 'to_entries[] | "\(.key)=\(.value)"' /tmp/fleet-vars.json
+          } >> .env.production
+          if [ -f .dockerignore ]; then printf '\n!.env.production\n' >> .dockerignore; fi
+          {
+            echo "args<<FLEET_EOF"
+            jq -r 'to_entries[] | "\(.key)=\(.value)"' /tmp/fleet-vars.json
+            echo "FLEET_ENV=${{ matrix.env }}"
+            echo "BUILD_ID=${{ github.sha }}"
+            echo "FLEET_EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "hash=$(jq -cS . /tmp/fleet-vars.json | sha256sum | cut -c1-64)" >> "$GITHUB_OUTPUT"
+
+      # Tagged per BRANCH and ENVIRONMENT (…-<ref_name>-<env>:latest). k8smgr's imageRepoTmpl
+      # seeds `{prefix}-{workspace}-{ref}` and the fleet pins the repository this run's marker
+      # names, so a declaration follows the image wherever the build put it.
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          tags: |
+            ${{ secrets.ARTIFACT_REGISTRY_REGION }}/${{ secrets.ARTIFACT_REGISTRY }}/${{ steps.img.outputs.repo_name }}-${{ github.ref_name }}-${{ matrix.env }}:${{ github.sha }}
+            ${{ secrets.ARTIFACT_REGISTRY_REGION }}/${{ secrets.ARTIFACT_REGISTRY }}/${{ steps.img.outputs.repo_name }}-${{ github.ref_name }}-${{ matrix.env }}:${{ steps.img.outputs.version }}
+            ${{ secrets.ARTIFACT_REGISTRY_REGION }}/${{ secrets.ARTIFACT_REGISTRY }}/${{ steps.img.outputs.repo_name }}-${{ github.ref_name }}-${{ matrix.env }}:latest
+          build-args: ${{ steps.benv.outputs.args }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.img.outputs.version }}
+            fleet.env=${{ matrix.env }}
+            fleet.buildenv=${{ steps.benv.outputs.hash }}
+
+      # Three markers, read by collector/ci_poller from this job's log. The DIGEST is what
+      # Fleet pins and deploys — a version tag is mutable, and an approval of a mutable
+      # reference is not an approval. FLEET_VERSION only gives that digest a name a person
+      # can read; nothing pins to it. FLEET_BUILD_ENV names the variables the image was built
+      # with. Each on its own line, and free of any secret, so GitHub's log masking cannot
+      # turn the label into "***".
+      - name: Output fleet image ref
+        run: |
+          echo "FLEET_IMAGE[${{ matrix.env }}]=${{ secrets.ARTIFACT_REGISTRY_REGION }}/${{ secrets.ARTIFACT_REGISTRY }}/${{ steps.img.outputs.repo_name }}-${{ github.ref_name }}-${{ matrix.env }}@${{ steps.push.outputs.digest }}"
+          echo "FLEET_BUILD_ENV[${{ matrix.env }}]=${{ steps.benv.outputs.hash }}"
+          echo "FLEET_VERSION=${{ steps.img.outputs.version }}"
